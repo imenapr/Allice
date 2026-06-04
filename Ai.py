@@ -1,11 +1,9 @@
 import tkinter as tk
 from tkinter import ttk
 import webbrowser
-import psutil
 import requests
 import json
 import threading
-import subprocess
 
 
 # ---------------- CHAT UI ----------------
