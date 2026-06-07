@@ -3,7 +3,7 @@ ALLICE — Main Workspace
 Central workspace: message feed, input bar, terminal panel.
 """
 
-import threading
+import sys
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QFrame, QScrollArea,
@@ -12,7 +12,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QTimer, QProcess, QThread, QObject
 from PySide6.QtGui import QFont, QKeyEvent, QColor
 
+from core.agent import AgentState
+from core.file_manager import ProjectFileManager
 from ui.components.message_block import MessageBlock, ThinkingIndicator
+from ui.file_editor import FileEditorPanel
 
 
 class StreamWorker(QObject):
@@ -209,7 +212,11 @@ class TerminalPanel(QWidget):
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.readyReadStandardError.connect(self._on_stderr)
         self._process.finished.connect(self._on_finish)
-        self._process.start("bash", ["-c", command])
+
+        if sys.platform == "win32":
+            self._process.start("cmd.exe", ["/c", command])
+        else:
+            self._process.start("bash", ["-c", command])
 
     def _on_stdout(self):
         data = self._process.readAllStandardOutput().data().decode(errors="replace")
@@ -242,18 +249,21 @@ class Workspace(QWidget):
     """
 
     context_updated = Signal(int, int)  # (message_count, token_estimate)
+    file_saved = Signal(str)
 
-    def __init__(self, ollama_client, agent, parent=None):
+    def __init__(self, ollama_client, agent, file_manager: ProjectFileManager, parent=None):
         super().__init__(parent)
         self.setObjectName("workspace")
         self.ollama = ollama_client
         self.agent = agent
+        self.file_manager = file_manager
 
         self._messages: list[dict] = []
         self._current_block: MessageBlock | None = None
         self._thread: QThread | None = None
         self._worker: StreamWorker | None = None
         self._terminal_visible = False
+        self._editor_visible = False
 
         # System prompt
         self._messages.append({
@@ -327,6 +337,14 @@ class Workspace(QWidget):
 
         self.scroll.setWidget(self.msg_container)
         self.splitter.addWidget(self.scroll)
+
+        # File editor panel (shown when a file is opened)
+        self.file_editor = FileEditorPanel(self.file_manager)
+        self.file_editor.setFixedHeight(300)
+        self.file_editor.hide()
+        self.file_editor.file_saved.connect(self.file_saved.emit)
+        self.file_editor.file_closed.connect(self._hide_editor)
+        self.splitter.addWidget(self.file_editor)
 
         # Terminal panel
         self.terminal = TerminalPanel()
@@ -449,14 +467,8 @@ class Workspace(QWidget):
 
         # Start streaming in background thread
         self._thread = QThread()
-        self._worker = StreamWorker(
-            self.ollama,
-            [m for m in self._messages if m["role"] != "system"] + 
-            [{"role": "system", "content": self._messages[0]["content"]}]
-            if len(self._messages) > 1 else self._messages
-        )
-        # Actually pass full messages including system
-        self._worker = StreamWorker(self.ollama, list(self._messages))
+        messages = self._build_messages_with_context()
+        self._worker = StreamWorker(self.ollama, messages)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.token.connect(self._on_token)
@@ -508,6 +520,43 @@ class Workspace(QWidget):
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+    def _build_messages_with_context(self) -> list[dict]:
+        """Build message list, injecting selected file contents into context."""
+        messages = list(self._messages)
+        file_context = self.file_manager.get_selected_context()
+        if file_context:
+            context_msg = {
+                "role": "system",
+                "content": (
+                    "The user has selected the following project files for context. "
+                    "Use this information when answering:\n\n" + file_context
+                ),
+            }
+            # Insert after the main system prompt
+            messages.insert(1, context_msg)
+        return messages
+
+    def open_file(self, relative_path: str):
+        """Open a file in the editor panel."""
+        self.agent.set_state(AgentState.READING)
+        if self.file_editor.open_file(relative_path):
+            self._editor_visible = True
+            self.file_editor.show()
+        self.agent.set_state(AgentState.IDLE)
+
+    def _hide_editor(self):
+        self._editor_visible = False
+        self.file_editor.hide()
+
+    def on_file_selection_changed(self, selected: list[str]):
+        """Called when user checks/unchecks files in the context panel."""
+        pass  # Selection is read at send time via file_manager
+
+    def on_project_changed(self, project_path: str):
+        """Called when user opens a different project folder."""
+        if self._editor_visible:
+            self._hide_editor()
 
     def new_conversation(self):
         """Reset workspace for a new chat."""

@@ -1,16 +1,19 @@
 """
 ALLICE — Right Context Panel
-System stats, file explorer, AI memory, and task status.
+System stats, file explorer with selection, AI memory, and task status.
 """
 
+import os
 import psutil
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QProgressBar, QScrollArea, QFrame, QTreeWidget,
-    QTreeWidgetItem, QPushButton, QSizePolicy,
+    QTreeWidgetItem, QPushButton, QFileDialog, QMessageBox,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QFont
+
+from core.file_manager import ProjectFileManager
 
 
 class StatRow(QWidget):
@@ -55,7 +58,6 @@ class StatRow(QWidget):
         else:
             self.value_label.setText(f"{percent:.0f}%")
 
-        # Color coding
         if percent > 85:
             self.bar.setProperty("danger", True)
             self.bar.setProperty("warning", False)
@@ -87,17 +89,22 @@ class SectionHeader(QWidget):
 
 class ContextPanel(QWidget):
     panel_close_requested = Signal()
+    file_open_requested = Signal(str)       # relative path — open in editor
+    selection_changed = Signal(list)       # list of selected relative paths
+    project_changed = Signal(str)            # new project root path
 
-    def __init__(self, parent=None):
+    def __init__(self, file_manager: ProjectFileManager, parent=None):
         super().__init__(parent)
         self.setObjectName("right_panel")
+        self.fm = file_manager
+        self._path_to_item: dict[str, QTreeWidgetItem] = {}
         self._build()
 
-        # Stats refresh timer
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_stats)
         self._timer.start(2000)
         self._refresh_stats()
+        self.refresh_file_tree()
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -182,10 +189,7 @@ class ContextPanel(QWidget):
 
         self._content_layout.addWidget(status_container)
 
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.HLine)
-        sep2.setStyleSheet("background-color: #21262d; max-height: 1px;")
-        self._content_layout.addWidget(sep2)
+        self._add_separator()
 
         # ── System Stats ──
         self._content_layout.addWidget(SectionHeader("SYSTEM"))
@@ -205,30 +209,89 @@ class ContextPanel(QWidget):
         st_layout.addWidget(self.gpu_row)
         self._content_layout.addWidget(stats_container)
 
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.HLine)
-        sep3.setStyleSheet("background-color: #21262d; max-height: 1px;")
-        self._content_layout.addWidget(sep3)
+        self._add_separator()
 
         # ── Project Files ──
-        self._content_layout.addWidget(SectionHeader("PROJECT FILES"))
+        files_header = QWidget()
+        fh_layout = QHBoxLayout(files_header)
+        fh_layout.setContentsMargins(16, 10, 16, 4)
+
+        files_title = QLabel("PROJECT FILES")
+        files_title.setObjectName("panel_section_title")
+        ff = QFont()
+        ff.setPointSize(9)
+        ff.setBold(True)
+        files_title.setFont(ff)
+        fh_layout.addWidget(files_title)
+        fh_layout.addStretch()
+        self._content_layout.addWidget(files_header)
+
+        # Project path + open button
+        proj_row = QWidget()
+        pr_layout = QHBoxLayout(proj_row)
+        pr_layout.setContentsMargins(16, 0, 16, 4)
+
+        self.project_path_label = QLabel(self.fm.project_name)
+        self.project_path_label.setObjectName("stat_label")
+        self.project_path_label.setToolTip(str(self.fm.project_root))
+        pf = QFont()
+        pf.setPointSize(10)
+        self.project_path_label.setFont(pf)
+        pr_layout.addWidget(self.project_path_label, stretch=1)
+
+        open_btn = QPushButton("Open")
+        open_btn.setObjectName("toggle_panel_btn")
+        open_btn.setFixedHeight(22)
+        open_btn.setCursor(Qt.PointingHandCursor)
+        open_btn.setToolTip("Open a different project folder")
+        open_btn.clicked.connect(self._open_project_dialog)
+        pr_layout.addWidget(open_btn)
+        self._content_layout.addWidget(proj_row)
+
+        # Selection controls
+        sel_row = QWidget()
+        sr_layout = QHBoxLayout(sel_row)
+        sr_layout.setContentsMargins(16, 0, 16, 4)
+        sr_layout.setSpacing(4)
+
+        self.selected_count_label = QLabel("0 selected")
+        self.selected_count_label.setObjectName("stat_label")
+        sf = QFont()
+        sf.setPointSize(10)
+        self.selected_count_label.setFont(sf)
+        sr_layout.addWidget(self.selected_count_label)
+        sr_layout.addStretch()
+
+        for label, handler in [("All", self._select_all), ("None", self._clear_selection)]:
+            btn = QPushButton(label)
+            btn.setObjectName("toggle_panel_btn")
+            btn.setFixedHeight(20)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(handler)
+            sr_layout.addWidget(btn)
+
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setObjectName("toggle_panel_btn")
+        refresh_btn.setFixedSize(22, 20)
+        refresh_btn.setCursor(Qt.PointingHandCursor)
+        refresh_btn.setToolTip("Refresh file tree")
+        refresh_btn.clicked.connect(self.refresh_file_tree)
+        sr_layout.addWidget(refresh_btn)
+        self._content_layout.addWidget(sel_row)
 
         self.file_tree = QTreeWidget()
         self.file_tree.setObjectName("file_tree")
         self.file_tree.setHeaderHidden(True)
         self.file_tree.setIndentation(14)
-        self.file_tree.setFixedHeight(200)
+        self.file_tree.setFixedHeight(220)
         ft_font = QFont()
         ft_font.setPointSize(11)
         self.file_tree.setFont(ft_font)
+        self.file_tree.itemChanged.connect(self._on_item_changed)
+        self.file_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._content_layout.addWidget(self.file_tree)
 
-        self._populate_default_tree()
-
-        sep4 = QFrame()
-        sep4.setFrameShape(QFrame.HLine)
-        sep4.setStyleSheet("background-color: #21262d; max-height: 1px;")
-        self._content_layout.addWidget(sep4)
+        self._add_separator()
 
         # ── Context Memory ──
         self._content_layout.addWidget(SectionHeader("CONTEXT MEMORY"))
@@ -250,46 +313,151 @@ class ContextPanel(QWidget):
         self.ctx_tokens.setFont(fm2)
         m_layout.addWidget(self.ctx_tokens)
 
+        self.ctx_files = QLabel("0 files selected")
+        self.ctx_files.setObjectName("stat_label")
+        self.ctx_files.setFont(fm2)
+        m_layout.addWidget(self.ctx_files)
+
         self._content_layout.addWidget(mem_container)
         self._content_layout.addStretch()
 
         scroll.setWidget(content)
         layout.addWidget(scroll)
 
-    def _populate_default_tree(self):
+    def _add_separator(self):
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("background-color: #21262d; max-height: 1px;")
+        self._content_layout.addWidget(sep)
+
+    def refresh_file_tree(self):
+        """Rebuild the file tree from the current project."""
+        self.file_tree.blockSignals(True)
         self.file_tree.clear()
-        root = QTreeWidgetItem(self.file_tree, ["📁 allice/"])
-        root.setExpanded(True)
+        self._path_to_item.clear()
 
-        for name in ["main.py", "README.md"]:
-            QTreeWidgetItem(root, [f"📄 {name}"])
+        tree = self.fm.build_tree()
+        root_entry = tree["_entry"]
+        root_item = QTreeWidgetItem(self.file_tree, [f"📁 {root_entry.name}/"])
+        root_item.setData(0, Qt.UserRole, "")
+        root_item.setExpanded(True)
 
-        core = QTreeWidgetItem(root, ["📁 core/"])
-        for name in ["ollama_client.py", "agent.py"]:
-            QTreeWidgetItem(core, [f"🐍 {name}"])
+        self._populate_tree_node(root_item, tree["children"])
+        self.file_tree.blockSignals(False)
+        self._update_selection_label()
 
-        ui = QTreeWidgetItem(root, ["📁 ui/"])
-        for name in ["app.py", "sidebar.py", "workspace.py"]:
-            QTreeWidgetItem(ui, [f"🐍 {name}"])
+    def _populate_tree_node(self, parent_item: QTreeWidgetItem, children: dict):
+        for name in sorted(children.keys(), key=lambda n: (not children[n]["_entry"].is_dir, n.lower())):
+            node = children[name]
+            entry = node["_entry"]
+
+            if entry.is_dir:
+                icon = "📁"
+                label = f"{icon} {name}/"
+                item = QTreeWidgetItem(parent_item, [label])
+                item.setData(0, Qt.UserRole, entry.path)
+                self._populate_tree_node(item, node["children"])
+            else:
+                ext = os.path.splitext(name)[1].lower()
+                icon = self._file_icon(ext)
+                size_str = self.fm.format_size(entry.size)
+                label = f"{icon} {name}  ({size_str})"
+                item = QTreeWidgetItem(parent_item, [label])
+                item.setData(0, Qt.UserRole, entry.path)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.Checked if entry.path in self.fm.selected_files else Qt.Unchecked)
+                self._path_to_item[entry.path] = item
+
+    @staticmethod
+    def _file_icon(ext: str) -> str:
+        icons = {
+            ".py": "🐍", ".js": "📜", ".ts": "📜", ".tsx": "⚛",
+            ".jsx": "⚛", ".html": "🌐", ".css": "🎨", ".json": "📋",
+            ".md": "📝", ".txt": "📄", ".yml": "⚙", ".yaml": "⚙",
+            ".toml": "⚙", ".qss": "🎨", ".sql": "🗄", ".sh": "💻",
+        }
+        return icons.get(ext, "📄")
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
+        path = item.data(0, Qt.UserRole)
+        if not path:
+            return
+
+        self.file_tree.blockSignals(True)
+        if item.checkState(0) == Qt.Checked:
+            self.fm.select_file(path)
+        else:
+            self.fm.deselect_file(path)
+        self.file_tree.blockSignals(False)
+        self._update_selection_label()
+        self.selection_changed.emit(self.fm.selected_files)
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        path = item.data(0, Qt.UserRole)
+        if not path:
+            return
+
+        # Only open files, not directories
+        if item.flags() & Qt.ItemIsUserCheckable:
+            self.file_open_requested.emit(path)
+
+    def _select_all(self):
+        self.file_tree.blockSignals(True)
+        self.fm.select_all_files()
+        for path, item in self._path_to_item.items():
+            item.setCheckState(0, Qt.Checked)
+        self.file_tree.blockSignals(False)
+        self._update_selection_label()
+        self.selection_changed.emit(self.fm.selected_files)
+
+    def _clear_selection(self):
+        self.file_tree.blockSignals(True)
+        self.fm.clear_selection()
+        for item in self._path_to_item.values():
+            item.setCheckState(0, Qt.Unchecked)
+        self.file_tree.blockSignals(False)
+        self._update_selection_label()
+        self.selection_changed.emit(self.fm.selected_files)
+
+    def _update_selection_label(self):
+        count = len(self.fm.selected_files)
+        self.selected_count_label.setText(f"{count} selected")
+        self.ctx_files.setText(f"{count} file{'s' if count != 1 else ''} selected")
+
+    def _open_project_dialog(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Open Project Folder",
+            str(self.fm.project_root),
+        )
+        if not folder:
+            return
+
+        ok, err = self.fm.set_project_root(folder)
+        if not ok:
+            QMessageBox.warning(self, "Cannot Open Project", err)
+            return
+
+        self.project_path_label.setText(self.fm.project_name)
+        self.project_path_label.setToolTip(str(self.fm.project_root))
+        self.refresh_file_tree()
+        self.project_changed.emit(str(self.fm.project_root))
 
     def _refresh_stats(self):
-        # CPU
         cpu = psutil.cpu_percent(interval=None)
         self.cpu_row.update(cpu)
 
-        # RAM
         mem = psutil.virtual_memory()
         ram_pct = mem.percent
         ram_used = mem.used / (1024 ** 3)
         ram_total = mem.total / (1024 ** 3)
         self.ram_row.update(ram_pct, f"{ram_used:.1f}/{ram_total:.0f}GB")
 
-        # GPU — optional, graceful fallback
         try:
             import subprocess
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=1
+                capture_output=True, text=True, timeout=1,
             )
             if result.returncode == 0:
                 gpu_pct = float(result.stdout.strip())

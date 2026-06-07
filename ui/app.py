@@ -3,7 +3,7 @@ ALLICE — Main Application Window
 Assembles sidebar + workspace + context panel.
 """
 
-import threading
+import os
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout,
     QSplitter, QApplication,
@@ -13,6 +13,7 @@ from PySide6.QtGui import QFont
 
 from core.ollama_client import OllamaClient, AVAILABLE_MODELS
 from core.agent import Agent
+from core.file_manager import ProjectFileManager
 from ui.sidebar import Sidebar
 from ui.workspace import Workspace
 from ui.context_panel import ContextPanel
@@ -53,6 +54,8 @@ class AlliceWindow(QMainWindow):
         # Core
         self.ollama = OllamaClient()
         self.agent = Agent()
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.file_manager = ProjectFileManager(project_root)
 
         self._conversations: dict[str, list] = {}
         self._conv_counter = 0
@@ -74,11 +77,11 @@ class AlliceWindow(QMainWindow):
         layout.addWidget(self.sidebar)
 
         # ── Workspace (fills remaining space) ──
-        self.workspace = Workspace(self.ollama, self.agent)
+        self.workspace = Workspace(self.ollama, self.agent, self.file_manager)
         layout.addWidget(self.workspace, stretch=1)
 
         # ── Right Context Panel (fixed width, collapsible) ──
-        self.context_panel = ContextPanel()
+        self.context_panel = ContextPanel(self.file_manager)
         layout.addWidget(self.context_panel)
 
     def _connect_signals(self):
@@ -86,12 +89,19 @@ class AlliceWindow(QMainWindow):
         self.sidebar.new_chat_requested.connect(self._new_chat)
         self.sidebar.model_changed.connect(self._on_model_changed)
         self.sidebar.conversation_selected.connect(self._on_conv_selected)
+        self.sidebar.nav_changed.connect(self._on_nav_changed)
 
         # Agent state → context panel
         self.agent.state_changed.connect(self.context_panel.update_agent_state)
 
         # Context stats
         self.workspace.context_updated.connect(self.context_panel.update_context)
+
+        # File operations
+        self.context_panel.file_open_requested.connect(self.workspace.open_file)
+        self.context_panel.selection_changed.connect(self.workspace.on_file_selection_changed)
+        self.context_panel.project_changed.connect(self._on_project_changed)
+        self.workspace.file_saved.connect(self.context_panel.refresh_file_tree)
 
         # Right panel close
         self.context_panel.panel_close_requested.connect(self._toggle_context_panel)
@@ -113,6 +123,14 @@ class AlliceWindow(QMainWindow):
     def _on_conv_selected(self, conv_id: str):
         # Future: restore conversation history
         pass
+
+    def _on_nav_changed(self, page_id: str):
+        if page_id == "projects":
+            self.context_panel.setVisible(True)
+            self.context_panel.file_tree.setFocus()
+
+    def _on_project_changed(self, project_path: str):
+        self.workspace.on_project_changed(project_path)
 
     def _toggle_context_panel(self):
         self.context_panel.setVisible(not self.context_panel.isVisible())

@@ -14,16 +14,10 @@ Inspired by Claude Desktop, Cursor, and Linear.
 ## Setup
 
 ```bash
-# 1. Install Python dependencies
-pip install -r requirements.txt
-
-# 2. Start Ollama (in a separate terminal)
+# 1. Start Ollama (in a separate terminal)
 ollama serve
 
-# 3. Pull a model
-ollama pull qwen2.5-coder:7b
-
-# 4. Run ALLICE
+# 2. Run ALLICE
 python main.py
 ```
 
