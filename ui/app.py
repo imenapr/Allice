@@ -103,6 +103,7 @@ class AlliceWindow(QMainWindow):
         self.context_panel.selection_changed.connect(self.workspace.on_file_selection_changed)
         self.context_panel.project_changed.connect(self._on_project_changed)
         self.workspace.file_saved.connect(self.context_panel.refresh_file_tree)
+        self.workspace.attach_requested.connect(self._show_project_files)
 
         # Conversation persistence
         self.workspace.conversation_title_changed.connect(self._on_conversation_title_changed)
@@ -158,8 +159,11 @@ class AlliceWindow(QMainWindow):
 
     def _on_nav_changed(self, page_id: str):
         if page_id == "projects":
-            self.context_panel.setVisible(True)
-            self.context_panel.file_tree.setFocus()
+            self._show_project_files()
+
+    def _show_project_files(self):
+        self.context_panel.setVisible(True)
+        self.context_panel.file_tree.setFocus()
 
     def _on_project_changed(self, project_path: str):
         self.workspace.on_project_changed(project_path)
@@ -177,6 +181,8 @@ class AlliceWindow(QMainWindow):
         self._poll_thread.start()
 
     def closeEvent(self, event):
+        if hasattr(self, "context_panel"):
+            self.context_panel.stop_workers()
         if hasattr(self, "_poller"):
             self._poller.stop()
         if hasattr(self, "_poll_thread"):

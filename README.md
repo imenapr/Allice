@@ -79,9 +79,9 @@ allice/
 - [x] Step 6: Agent state machine (thinking/coding/executing)
 - [x] Step 7: Right context panel (system stats, file tree, memory)
 - [x] Step 8: Embedded terminal panel
-- [ ] Step 9: File explorer with project loading
+- [x] Step 9: File explorer with project loading
 - [ ] Step 10: Code editor (QScintilla or Monaco via WebView)
-- [ ] Step 11: Agent tool use (read files, run commands)
+- [x] Step 11: Agent tool use (read files, edit files, run commands)
 - [ ] Step 12: Conversation persistence (SQLite)
 - [ ] Step 13: Semantic search over codebase
 - [ ] Step 14: Plugin system
@@ -93,4 +93,15 @@ allice/
 | `Enter` | Send message |
 | `Shift+Enter` | New line in input |
 | `⌨` button | Toggle terminal panel |
-| `📎` button | Attach file (coming soon) |
+| `📎` button | Choose project files |
+
+## Agent Tools
+
+ALLICE can ask the desktop app to perform local project actions while it answers:
+
+- Read selected or named project files
+- Write files with `<allice_write>` blocks
+- List folders in the active project
+- Run terminal commands from the active project folder
+
+After a tool runs, ALLICE receives the real result and can continue fixing or testing.

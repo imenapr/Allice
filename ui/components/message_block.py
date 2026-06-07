@@ -140,12 +140,20 @@ class MessageBlock(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Wrapper with padding
-        wrapper = QWidget()
-        wrapper.setObjectName("msg_container_user" if self.is_user else "msg_container_assistant")
-        wrapper_layout = QVBoxLayout(wrapper)
-        wrapper_layout.setContentsMargins(32, 20, 32, 20)
-        wrapper_layout.setSpacing(10)
+        row = QWidget()
+        row.setObjectName("msg_container_user" if self.is_user else "msg_container_assistant")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(32, 14, 32, 14)
+        row_layout.setSpacing(0)
+
+        bubble = QWidget()
+        bubble.setObjectName("msg_bubble_user" if self.is_user else "msg_bubble_assistant")
+        bubble.setMaximumWidth(820)
+        bubble.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Minimum)
+
+        wrapper_layout = QVBoxLayout(bubble)
+        wrapper_layout.setContentsMargins(14, 10, 14, 12)
+        wrapper_layout.setSpacing(8)
 
         # Role label row
         role_row = QHBoxLayout()
@@ -157,8 +165,12 @@ class MessageBlock(QWidget):
         f.setPointSize(10)
         f.setBold(True)
         role_label.setFont(f)
-        role_row.addWidget(role_label)
-        role_row.addStretch()
+        if self.is_user:
+            role_row.addStretch()
+            role_row.addWidget(role_label)
+        else:
+            role_row.addWidget(role_label)
+            role_row.addStretch()
         wrapper_layout.addLayout(role_row)
 
         # Content area - will hold text and code blocks
@@ -170,13 +182,14 @@ class MessageBlock(QWidget):
             self._render_content(initial_text)
 
         wrapper_layout.addLayout(self._content_layout)
-        outer.addWidget(wrapper)
+        if self.is_user:
+            row_layout.addStretch(1)
+            row_layout.addWidget(bubble, 0, Qt.AlignRight)
+        else:
+            row_layout.addWidget(bubble, 0, Qt.AlignLeft)
+            row_layout.addStretch(1)
 
-        # Separator line
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("background-color: #21262d; max-height: 1px;")
-        outer.addWidget(sep)
+        outer.addWidget(row)
 
     def _render_content(self, text: str):
         """Parse text into text segments and code blocks."""
@@ -197,6 +210,7 @@ class MessageBlock(QWidget):
                 lbl.setObjectName("msg_text_user" if self.is_user else "msg_text")
                 lbl.setWordWrap(True)
                 lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                lbl.setAlignment(Qt.AlignRight if self.is_user else Qt.AlignLeft)
                 f = QFont()
                 f.setPointSize(13)
                 lbl.setFont(f)
@@ -286,6 +300,14 @@ class ThinkingIndicator(QWidget):
 
         layout.addWidget(wrapper)
 
+        self.detail_label = QLabel("Starting...")
+        self.detail_label.setObjectName("agent_status_detail")
+        self.detail_label.setWordWrap(True)
+        f3 = QFont()
+        f3.setPointSize(11)
+        self.detail_label.setFont(f3)
+        layout.addWidget(self.detail_label)
+
     def update_state(self, state_name: str, label: str):
         self.action_label.setText(label)
         colors = {
@@ -297,6 +319,18 @@ class ThinkingIndicator(QWidget):
         }
         color = colors.get(state_name, "#484f58")
         self.dot_label.setStyleSheet(f"color: {color};")
+        details = {
+            "thinking": "Sending the request to the local model.",
+            "coding": "Preparing or applying file changes.",
+            "executing": "Running a local project action.",
+            "reading": "Loading selected project files.",
+            "error": "Something failed; check the message below.",
+            "idle": "Ready for your next request.",
+        }
+        self.set_detail(details.get(state_name, label))
+
+    def set_detail(self, text: str):
+        self.detail_label.setText(text)
 
     def _tick(self):
         self._dots = (self._dots + 1) % 4

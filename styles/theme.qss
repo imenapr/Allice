@@ -189,8 +189,19 @@ QScrollBar::sub-line:horizontal {
     background-color: transparent;
 }
 
+#msg_bubble_user {
+    background-color: #1f6feb;
+    border: 1px solid #388bfd;
+    border-radius: 8px;
+}
+#msg_bubble_assistant {
+    background-color: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 8px;
+}
+
 #msg_role_user {
-    color: #8b949e;
+    color: #c9d8ff;
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.5px;
@@ -264,6 +275,12 @@ QScrollBar::sub-line:horizontal {
 #agent_status_text {
     color: #8b949e;
     font-size: 12px;
+}
+#agent_status_detail {
+    color: #8b949e;
+    background-color: transparent;
+    font-size: 11px;
+    padding: 0px 14px 0px 14px;
 }
 
 /* ── Input Bar ── */

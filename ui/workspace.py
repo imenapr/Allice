@@ -13,7 +13,8 @@ from PySide6.QtCore import Qt, Signal, QTimer, QProcess, QThread, QObject
 from PySide6.QtGui import QFont, QKeyEvent, QColor
 
 from core.agent import AgentState
-from core.edit_executor import apply_edits, format_results_summary
+from core.agent_tools import clean_tool_blocks_for_display, run_requested_tools
+from core.edit_executor import format_results_summary
 from core.file_manager import ProjectFileManager
 from ui.components.message_block import MessageBlock, ThinkingIndicator
 from ui.file_editor import FileEditorPanel
@@ -30,6 +31,12 @@ SYSTEM_PROMPT = (
     "</allice_write>\n"
     "The IDE applies these blocks automatically. NEVER say you cannot edit files — use the block above. "
     "After writing, briefly confirm what you changed.\n\n"
+    "LOCAL TOOLS: You can ask the app to perform real project actions. Use these exact blocks, one per line:\n"
+    '<allice_read path="relative/path.py" />\n'
+    '<allice_list path="relative/folder" />\n'
+    '<allice_run command="python -m pytest" />\n'
+    "Use read/list before editing when you need current file contents. Use run after edits when tests or checks "
+    "are relevant. Commands run from the active project folder. After tool results return, continue working.\n\n"
     "Format explanations in markdown. Use ```language code blocks for examples shown to the user. "
     "Be concise, precise, and developer-friendly."
 )
@@ -60,6 +67,7 @@ class StreamWorker(QObject):
 class InputBar(QWidget):
     send_requested = Signal(str)
     toggle_terminal = Signal()
+    attach_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,7 +91,8 @@ class InputBar(QWidget):
         attach.setObjectName("attach_btn")
         attach.setFixedSize(36, 36)
         attach.setCursor(Qt.PointingHandCursor)
-        attach.setToolTip("Attach file")
+        attach.setToolTip("Choose project files")
+        attach.clicked.connect(self.attach_requested.emit)
         inner_layout.addWidget(attach)
 
         # Text input
@@ -163,6 +172,7 @@ class TerminalPanel(QWidget):
         self.setObjectName("terminal_panel")
         self._build()
         self._process = None
+        self._working_directory = ""
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -229,6 +239,8 @@ class TerminalPanel(QWidget):
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.readyReadStandardError.connect(self._on_stderr)
         self._process.finished.connect(self._on_finish)
+        if self._working_directory:
+            self._process.setWorkingDirectory(self._working_directory)
 
         if sys.platform == "win32":
             self._process.start("cmd.exe", ["/c", command])
@@ -254,6 +266,10 @@ class TerminalPanel(QWidget):
     def append_text(self, text: str, color: str = "#22c55e"):
         self.output.append(f"<span style='color:{color}'>{text}</span>")
 
+    def set_working_directory(self, path: str):
+        self._working_directory = path
+        self.append_text(f"Working folder: {path}", "#8b949e")
+
 
 class Workspace(QWidget):
     """
@@ -269,6 +285,7 @@ class Workspace(QWidget):
     file_saved = Signal(str)
     conversation_title_changed = Signal(str)  # new title
     conversation_updated = Signal()
+    attach_requested = Signal()
 
     def __init__(self, ollama_client, agent, file_manager: ProjectFileManager, parent=None):
         super().__init__(parent)
@@ -283,6 +300,7 @@ class Workspace(QWidget):
         self._worker: StreamWorker | None = None
         self._terminal_visible = False
         self._editor_visible = False
+        self._tool_rounds = 0
 
         self._messages.append({"role": "system", "content": SYSTEM_PROMPT})
 
@@ -358,6 +376,7 @@ class Workspace(QWidget):
 
         # Terminal panel
         self.terminal = TerminalPanel()
+        self.terminal.set_working_directory(str(self.file_manager.project_root))
         self.terminal.setFixedHeight(220)
         self.terminal.hide()
         self.splitter.addWidget(self.terminal)
@@ -373,6 +392,7 @@ class Workspace(QWidget):
         self.input_bar = InputBar()
         self.input_bar.send_requested.connect(self.send_message)
         self.input_bar.toggle_terminal.connect(self._toggle_terminal)
+        self.input_bar.attach_requested.connect(self.attach_requested.emit)
         layout.addWidget(self.input_bar)
 
     def _show_welcome(self):
@@ -472,9 +492,14 @@ class Workspace(QWidget):
         # Show thinking
         self.input_bar.set_enabled(False)
         self.thinking.show()
+        self._tool_rounds = 0
         if self.file_manager.selected_files:
             self.agent.set_state(AgentState.READING)
+            self.thinking.set_detail(
+                f"Reading {len(self.file_manager.selected_files)} selected project file(s)."
+            )
         self.agent.begin_response()
+        self.thinking.set_detail("Sending your request to Ollama and waiting for a response.")
 
         # Create assistant block (empty, will fill by streaming)
         self._current_block = self._add_message_block("assistant", "")
@@ -483,6 +508,23 @@ class Workspace(QWidget):
         self._thread = QThread()
         messages = self._build_messages_with_context()
         self._worker = StreamWorker(self.ollama, messages)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.token.connect(self._on_token)
+        self._worker.done.connect(self._on_done)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(self._thread.quit)
+        self._thread.start()
+
+    def _continue_after_tools(self, tool_feedback: str):
+        """Send real local tool results back to Ollama so it can continue."""
+        self._messages.append({"role": "user", "content": tool_feedback})
+        self.agent.begin_response()
+        self.thinking.set_detail("Sending local tool results back to ALLICE so it can continue.")
+        self._current_block = self._add_message_block("assistant", "")
+
+        self._thread = QThread()
+        self._worker = StreamWorker(self.ollama, [dict(m) for m in self._messages])
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.token.connect(self._on_token)
@@ -503,23 +545,36 @@ class Workspace(QWidget):
         if self._current_block:
             self._current_block.append_token(token)
         self.agent.on_token(token)
+        if self.agent.state == AgentState.THINKING:
+            self.thinking.set_detail("Receiving ALLICE's response.")
         QTimer.singleShot(10, self._scroll_to_bottom)
 
     def _on_done(self, full_reply: str):
-        # Apply any <allice_write> file edits from the response
-        edit_results = apply_edits(self.file_manager, full_reply)
-        display_reply = full_reply
-        if edit_results:
+        tool_result = run_requested_tools(self.file_manager, full_reply)
+        edit_results = tool_result.edits or []
+        display_reply = clean_tool_blocks_for_display(full_reply) or "Working with local project tools..."
+        if tool_result.requested:
+            self.agent.set_state(AgentState.EXECUTING)
+            self.thinking.set_detail("Running requested local project actions.")
+            display_reply = display_reply + "\n\n---\n\n" + tool_result.display
+        elif edit_results:
             self.agent.set_state(AgentState.CODING)
+            self.thinking.set_detail("Applying file edits from ALLICE.")
             summary = format_results_summary(edit_results)
-            display_reply = full_reply + "\n\n---\n\n" + summary
-            for r in edit_results:
-                if r.success:
-                    self.file_saved.emit(r.path)
+            display_reply = display_reply + "\n\n---\n\n" + summary
+
+        for path in tool_result.changed_paths or []:
+            self.file_saved.emit(path)
 
         if self._current_block:
             self._current_block.finalize(display_reply)
         self._messages.append({"role": "assistant", "content": full_reply})
+
+        if tool_result.requested and self._tool_rounds < 4:
+            self._tool_rounds += 1
+            QTimer.singleShot(50, lambda: self._continue_after_tools(tool_result.feedback))
+            return
+
         self.agent.on_done(full_reply)
 
         self.thinking.stop()
@@ -604,6 +659,7 @@ class Workspace(QWidget):
         """Called when user opens a different project folder."""
         if self._editor_visible:
             self._hide_editor()
+        self.terminal.set_working_directory(project_path)
 
     def export_state(self) -> dict:
         """Serialize conversation for switching between chats."""

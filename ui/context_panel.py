@@ -10,11 +10,66 @@ from PySide6.QtWidgets import (
     QProgressBar, QScrollArea, QFrame, QTreeWidget,
     QTreeWidgetItem, QPushButton, QFileDialog, QMessageBox,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread
 from PySide6.QtGui import QFont
 
 from core.file_manager import ProjectFileManager
 from core.system_stats import get_disk_active_percent
+
+
+class SlowStatsWorker(QObject):
+    """
+    Runs slow Windows hardware probes away from the UI thread.
+
+    Startup bottleneck found here: ContextPanel.__init__ called _refresh_stats()
+    synchronously, which could run nvidia-smi plus three PowerShell Get-Counter
+    calls before the main window became movable. On some Windows machines those
+    subprocesses take many seconds despite low CPU/disk usage.
+    """
+
+    stats_ready = Signal(object, object)  # gpu_percent | None, drive percents dict
+    finished = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        import subprocess
+        import time
+
+        while self._running:
+            gpu_pct = None
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    gpu_pct = float(result.stdout.strip().splitlines()[0])
+            except Exception:
+                gpu_pct = None
+
+            drives = {}
+            for letter in ("C", "D", "E"):
+                if not self._running:
+                    break
+                drives[letter] = get_disk_active_percent(letter)
+
+            if self._running:
+                self.stats_ready.emit(gpu_pct, drives)
+
+            for _ in range(50):
+                if not self._running:
+                    break
+                time.sleep(0.1)
+
+        self.finished.emit()
 
 
 class StatRow(QWidget):
@@ -99,13 +154,18 @@ class ContextPanel(QWidget):
         self.setObjectName("right_panel")
         self.fm = file_manager
         self._path_to_item: dict[str, QTreeWidgetItem] = {}
+        self._stats_thread: QThread | None = None
+        self._stats_worker: SlowStatsWorker | None = None
         self._build()
 
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._refresh_stats)
+        self._timer.timeout.connect(self._refresh_fast_stats)
         self._timer.start(2000)
-        self._refresh_stats()
-        self.refresh_file_tree()
+        self._refresh_fast_stats()
+
+        # Let the main window appear before recursively scanning project files.
+        QTimer.singleShot(100, self.refresh_file_tree)
+        QTimer.singleShot(250, self._start_slow_stats_worker)
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -298,6 +358,7 @@ class ContextPanel(QWidget):
         self.file_tree.itemChanged.connect(self._on_item_changed)
         self.file_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._content_layout.addWidget(self.file_tree)
+        QTreeWidgetItem(self.file_tree, ["Loading project files..."])
 
         self._add_separator()
 
@@ -451,7 +512,8 @@ class ContextPanel(QWidget):
         self.refresh_file_tree()
         self.project_changed.emit(str(self.fm.project_root))
 
-    def _refresh_stats(self):
+    def _refresh_fast_stats(self):
+        """Refresh cheap psutil values on the UI thread only."""
         cpu = psutil.cpu_percent(interval=None)
         self.cpu_row.update(cpu)
 
@@ -461,29 +523,43 @@ class ContextPanel(QWidget):
         ram_total = mem.total / (1024 ** 3)
         self.ram_row.update(ram_pct, f"{ram_used:.1f}/{ram_total:.0f}GB")
 
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=1,
-            )
-            if result.returncode == 0:
-                gpu_pct = float(result.stdout.strip())
-                self.gpu_row.update(gpu_pct)
-            else:
-                self.gpu_row.value_label.setText("N/A")
-                self.gpu_row.bar.setValue(0)
-        except Exception:
+    def _start_slow_stats_worker(self):
+        if self._stats_thread is not None:
+            return
+
+        self._stats_thread = QThread(self)
+        self._stats_worker = SlowStatsWorker()
+        self._stats_worker.moveToThread(self._stats_thread)
+        self._stats_thread.started.connect(self._stats_worker.run)
+        self._stats_worker.stats_ready.connect(self._apply_slow_stats)
+        self._stats_worker.finished.connect(self._stats_thread.quit)
+        self._stats_worker.finished.connect(self._stats_worker.deleteLater)
+        self._stats_thread.finished.connect(self._stats_thread.deleteLater)
+        self._stats_thread.start()
+
+    def _apply_slow_stats(self, gpu_pct, drives):
+        if gpu_pct is not None:
+            self.gpu_row.update(float(gpu_pct))
+        else:
             self.gpu_row.value_label.setText("N/A")
             self.gpu_row.bar.setValue(0)
 
-        for letter, row in self._drive_rows.items():
-            active_pct = get_disk_active_percent(letter)
+        for letter, active_pct in dict(drives).items():
+            row = self._drive_rows.get(letter)
+            if row is None:
+                continue
             if active_pct is not None:
                 row.update(active_pct)
             else:
                 row.value_label.setText("N/A")
                 row.bar.setValue(0)
+
+    def stop_workers(self):
+        if self._stats_worker is not None:
+            self._stats_worker.stop()
+        if self._stats_thread is not None:
+            self._stats_thread.quit()
+            self._stats_thread.wait(1500)
 
     def update_agent_state(self, state_name: str, label: str):
         self.agent_state_label.setText(label)
