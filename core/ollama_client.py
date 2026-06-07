@@ -9,6 +9,9 @@ from typing import Generator, Callable
 
 
 OLLAMA_BASE = "http://localhost:11434"
+# (connect seconds, max seconds between streamed chunks)
+# Model loading on first request can take several minutes.
+STREAM_TIMEOUT = (10, 600)
 AVAILABLE_MODELS = [
     "qwen2.5-coder:7b",
     "qwen3:4b",
@@ -68,7 +71,7 @@ class OllamaClient:
                 self.chat_url,
                 json=payload,
                 stream=True,
-                timeout=120,
+                timeout=STREAM_TIMEOUT,
             ) as res:
                 if not res.ok:
                     on_error(f"Ollama error {res.status_code}: {res.text[:200]}")
@@ -102,6 +105,19 @@ class OllamaClient:
         except requests.exceptions.ConnectionError:
             on_error(
                 "Cannot connect to Ollama. Make sure Ollama is running:\n"
+                "  $ ollama serve"
+            )
+        except requests.exceptions.ReadTimeout:
+            on_error(
+                "Ollama took too long to respond. This usually means:\n"
+                "  • The model is still loading (first request can take several minutes)\n"
+                "  • Your GPU/CPU is under heavy load\n"
+                "  • Too many files are selected as context\n\n"
+                "Try again in a moment, use a smaller model, or deselect some files."
+            )
+        except requests.exceptions.Timeout:
+            on_error(
+                "Connection to Ollama timed out. Check that Ollama is running:\n"
                 "  $ ollama serve"
             )
         except Exception as e:

@@ -28,8 +28,7 @@ def make_label(text="", object_name="", font_size=13, bold=False, wrap=True) -> 
     lbl.setObjectName(object_name)
     if wrap:
         lbl.setWordWrap(True)
-    f = lbl.font()
-    f.setPointSize(font_size)
+    f = QFont("Segoe UI", font_size)
     if bold:
         f.setBold(True)
     lbl.setFont(f)

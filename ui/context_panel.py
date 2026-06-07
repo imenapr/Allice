@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 
 from core.file_manager import ProjectFileManager
+from core.system_stats import get_disk_active_percent
 
 
 class StatRow(QWidget):
@@ -207,6 +208,13 @@ class ContextPanel(QWidget):
         st_layout.addWidget(self.cpu_row)
         st_layout.addWidget(self.ram_row)
         st_layout.addWidget(self.gpu_row)
+
+        self._drive_rows: dict[str, StatRow] = {}
+        for letter in ("C", "D", "E"):
+            row = StatRow(f"{letter}: Active")
+            self._drive_rows[letter] = row
+            st_layout.addWidget(row)
+
         self._content_layout.addWidget(stats_container)
 
         self._add_separator()
@@ -468,6 +476,14 @@ class ContextPanel(QWidget):
         except Exception:
             self.gpu_row.value_label.setText("N/A")
             self.gpu_row.bar.setValue(0)
+
+        for letter, row in self._drive_rows.items():
+            active_pct = get_disk_active_percent(letter)
+            if active_pct is not None:
+                row.update(active_pct)
+            else:
+                row.value_label.setText("N/A")
+                row.bar.setValue(0)
 
     def update_agent_state(self, state_name: str, label: str):
         self.agent_state_label.setText(label)

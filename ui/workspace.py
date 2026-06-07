@@ -13,9 +13,26 @@ from PySide6.QtCore import Qt, Signal, QTimer, QProcess, QThread, QObject
 from PySide6.QtGui import QFont, QKeyEvent, QColor
 
 from core.agent import AgentState
+from core.edit_executor import apply_edits, format_results_summary
 from core.file_manager import ProjectFileManager
 from ui.components.message_block import MessageBlock, ThinkingIndicator
 from ui.file_editor import FileEditorPanel
+
+
+SYSTEM_PROMPT = (
+    "You are ALLICE, a professional AI software engineering assistant built into a desktop IDE. "
+    "You have FULL read AND write access to the user's project files.\n\n"
+    "READING: When file contents are included in a message, they are the ACTUAL source from disk. "
+    "Analyze and reference them directly. NEVER say you cannot access or read files.\n\n"
+    "WRITING: You CAN edit files directly. To create or overwrite a file, include this block:\n"
+    '<allice_write path="relative/path/to/file">\n'
+    "full file content here\n"
+    "</allice_write>\n"
+    "The IDE applies these blocks automatically. NEVER say you cannot edit files — use the block above. "
+    "After writing, briefly confirm what you changed.\n\n"
+    "Format explanations in markdown. Use ```language code blocks for examples shown to the user. "
+    "Be concise, precise, and developer-friendly."
+)
 
 
 class StreamWorker(QObject):
@@ -250,6 +267,8 @@ class Workspace(QWidget):
 
     context_updated = Signal(int, int)  # (message_count, token_estimate)
     file_saved = Signal(str)
+    conversation_title_changed = Signal(str)  # new title
+    conversation_updated = Signal()
 
     def __init__(self, ollama_client, agent, file_manager: ProjectFileManager, parent=None):
         super().__init__(parent)
@@ -265,16 +284,7 @@ class Workspace(QWidget):
         self._terminal_visible = False
         self._editor_visible = False
 
-        # System prompt
-        self._messages.append({
-            "role": "system",
-            "content": (
-                "You are ALLICE, a professional AI software engineering assistant. "
-                "You help users write code, debug issues, understand repositories, "
-                "and build software. Format code in markdown code blocks with language tags. "
-                "Be concise, precise, and developer-friendly."
-            )
-        })
+        self._messages.append({"role": "system", "content": SYSTEM_PROMPT})
 
         self._build()
         self._connect_agent()
@@ -448,18 +458,22 @@ class Workspace(QWidget):
         if hasattr(self, "_welcome_widget") and self._welcome_widget.isVisible():
             self._welcome_widget.hide()
 
-        # Add user message
-        self._add_message_block("user", text)
+        # Add user message (display clean text; file context injected at API call time)
+        display_text = self._format_user_display(text)
+        self._add_message_block("user", display_text)
         self._messages.append({"role": "user", "content": text})
 
         # Update title from first message
         if self.title.text() == "New Conversation":
             short = text[:40] + ("…" if len(text) > 40 else "")
             self.title.setText(short)
+            self.conversation_title_changed.emit(short)
 
         # Show thinking
         self.input_bar.set_enabled(False)
         self.thinking.show()
+        if self.file_manager.selected_files:
+            self.agent.set_state(AgentState.READING)
         self.agent.begin_response()
 
         # Create assistant block (empty, will fill by streaming)
@@ -492,8 +506,19 @@ class Workspace(QWidget):
         QTimer.singleShot(10, self._scroll_to_bottom)
 
     def _on_done(self, full_reply: str):
+        # Apply any <allice_write> file edits from the response
+        edit_results = apply_edits(self.file_manager, full_reply)
+        display_reply = full_reply
+        if edit_results:
+            self.agent.set_state(AgentState.CODING)
+            summary = format_results_summary(edit_results)
+            display_reply = full_reply + "\n\n---\n\n" + summary
+            for r in edit_results:
+                if r.success:
+                    self.file_saved.emit(r.path)
+
         if self._current_block:
-            self._current_block.finalize(full_reply)
+            self._current_block.finalize(display_reply)
         self._messages.append({"role": "assistant", "content": full_reply})
         self.agent.on_done(full_reply)
 
@@ -506,6 +531,7 @@ class Workspace(QWidget):
         token_est = sum(len(m["content"].split()) * 1.3 for m in self._messages)
         self.context_updated.emit(msg_count, int(token_est))
         self.token_count_label.setText(f"~{int(token_est):,} tokens")
+        self.conversation_updated.emit()
 
         self._scroll_to_bottom()
 
@@ -521,20 +547,41 @@ class Workspace(QWidget):
         bar = self.scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+    def _format_user_display(self, text: str) -> str:
+        """What the user sees in the chat — with an attachment indicator."""
+        count = len(self.file_manager.selected_files)
+        if count:
+            label = f"📎 {count} project file{'s' if count != 1 else ''} attached\n\n"
+            return label + text
+        return text
+
+    def _format_user_with_files(self, text: str, file_context: str, file_count: int) -> str:
+        """What Ollama receives — file contents embedded directly in the user message."""
+        file_list = ", ".join(self.file_manager.selected_files)
+        return (
+            f"[PROJECT FILES ATTACHED — {file_count} file(s): {file_list}]\n"
+            f"The full contents of these files are provided below. "
+            f"You have full read access. Analyze and reference them directly.\n\n"
+            f"{file_context}\n\n"
+            f"---\n"
+            f"USER REQUEST:\n{text}"
+        )
+
     def _build_messages_with_context(self) -> list[dict]:
-        """Build message list, injecting selected file contents into context."""
-        messages = list(self._messages)
+        """Build the message list sent to Ollama, embedding file contents in the latest user turn."""
+        messages = [dict(m) for m in self._messages]
         file_context = self.file_manager.get_selected_context()
-        if file_context:
-            context_msg = {
-                "role": "system",
-                "content": (
-                    "The user has selected the following project files for context. "
-                    "Use this information when answering:\n\n" + file_context
-                ),
-            }
-            # Insert after the main system prompt
-            messages.insert(1, context_msg)
+        if not file_context:
+            return messages
+
+        file_count = len(self.file_manager.selected_files)
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i]["role"] == "user":
+                messages[i]["content"] = self._format_user_with_files(
+                    messages[i]["content"], file_context, file_count,
+                )
+                break
+
         return messages
 
     def open_file(self, relative_path: str):
@@ -558,24 +605,64 @@ class Workspace(QWidget):
         if self._editor_visible:
             self._hide_editor()
 
-    def new_conversation(self):
-        """Reset workspace for a new chat."""
-        # Clear message blocks
+    def export_state(self) -> dict:
+        """Serialize conversation for switching between chats."""
+        return {
+            "messages": [dict(m) for m in self._messages],
+            "title": self.title.text(),
+            "token_label": self.token_count_label.text(),
+            "has_messages": any(m["role"] in ("user", "assistant") for m in self._messages),
+        }
+
+    def load_state(self, state: dict | None):
+        """Restore a saved conversation into the workspace."""
+        self._clear_message_blocks()
+
+        if not state or not state.get("has_messages"):
+            self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            self._current_block = None
+            self.title.setText("New Conversation")
+            self.token_count_label.setText("0 tokens")
+            self._show_welcome()
+            self._welcome_widget.show()
+            self.context_updated.emit(0, 0)
+            return
+
+        self._messages = [dict(m) for m in state["messages"]]
+        if not self._messages or self._messages[0]["role"] != "system":
+            self._messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+
+        self.title.setText(state.get("title", "Conversation"))
+        self.token_count_label.setText(state.get("token_label", "0 tokens"))
+
+        if hasattr(self, "_welcome_widget"):
+            self._welcome_widget.hide()
+
+        for msg in self._messages:
+            if msg["role"] in ("user", "assistant"):
+                self._add_message_block(msg["role"], msg["content"])
+
+        msg_count = len([m for m in self._messages if m["role"] != "system"])
+        token_est = sum(len(m["content"].split()) * 1.3 for m in self._messages)
+        self.context_updated.emit(msg_count, int(token_est))
+        QTimer.singleShot(50, self._scroll_to_bottom)
+
+    def _clear_message_blocks(self):
         while self.msg_layout.count() > 1:
             item = self.msg_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        if hasattr(self, "_welcome_widget"):
+            self._welcome_widget.deleteLater()
+            del self._welcome_widget
 
-        self._messages = [{
-            "role": "system",
-            "content": (
-                "You are ALLICE, a professional AI software engineering assistant. "
-                "You help users write code, debug issues, understand repositories, "
-                "and build software. Format code in markdown code blocks with language tags."
-            )
-        }]
+    def new_conversation(self):
+        """Reset workspace for a new chat."""
+        self._clear_message_blocks()
+        self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._current_block = None
         self.title.setText("New Conversation")
         self.token_count_label.setText("0 tokens")
         self._show_welcome()
         self._welcome_widget.show()
+        self.context_updated.emit(0, 0)

@@ -16,8 +16,7 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QCoreApplication
-from PySide6.QtGui import QFontDatabase, QFont, QIcon
+from PySide6.QtGui import QFont
 
 from ui.app import AlliceWindow
 
@@ -32,10 +31,6 @@ def load_theme(app: QApplication) -> None:
 
 
 def main():
-    # Enable HiDPI
-    QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-
     app = QApplication(sys.argv)
     app.setApplicationName("ALLICE")
     app.setOrganizationName("ALLICE")

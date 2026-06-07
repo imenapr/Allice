@@ -57,8 +57,9 @@ class AlliceWindow(QMainWindow):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.file_manager = ProjectFileManager(project_root)
 
-        self._conversations: dict[str, list] = {}
+        self._conversations: dict[str, dict] = {}
         self._conv_counter = 0
+        self._active_conv_id: str | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -103,17 +104,36 @@ class AlliceWindow(QMainWindow):
         self.context_panel.project_changed.connect(self._on_project_changed)
         self.workspace.file_saved.connect(self.context_panel.refresh_file_tree)
 
+        # Conversation persistence
+        self.workspace.conversation_title_changed.connect(self._on_conversation_title_changed)
+        self.workspace.conversation_updated.connect(self._save_active_conversation)
+
         # Right panel close
         self.context_panel.panel_close_requested.connect(self._toggle_context_panel)
 
+    def _save_active_conversation(self):
+        if self._active_conv_id is None:
+            self._conv_counter += 1
+            self._active_conv_id = f"conv_{self._conv_counter}"
+            title = self.workspace.title.text()
+            if title == "New Conversation":
+                title = f"New Chat #{self._conv_counter}"
+            self.sidebar.add_conversation(title, self._active_conv_id, select=True)
+        self._conversations[self._active_conv_id] = self.workspace.export_state()
+
     def _new_chat(self):
+        self._save_active_conversation()
+
         self._conv_counter += 1
-        self.workspace.new_conversation()
         conv_id = f"conv_{self._conv_counter}"
+        self.workspace.new_conversation()
+        self._conversations[conv_id] = self.workspace.export_state()
+        self._active_conv_id = conv_id
+
         self.sidebar.add_conversation(
             f"New Chat #{self._conv_counter}",
             conv_id,
-            select=True
+            select=True,
         )
 
     def _on_model_changed(self, model: str):
@@ -121,8 +141,20 @@ class AlliceWindow(QMainWindow):
         self.context_panel.update_model(model)
 
     def _on_conv_selected(self, conv_id: str):
-        # Future: restore conversation history
-        pass
+        if conv_id == self._active_conv_id:
+            return
+
+        self._save_active_conversation()
+        self._active_conv_id = conv_id
+        state = self._conversations.get(conv_id)
+        self.workspace.load_state(state)
+        self.sidebar.select_conversation(conv_id)
+
+    def _on_conversation_title_changed(self, title: str):
+        if self._active_conv_id:
+            self.sidebar.update_conversation_title(self._active_conv_id, title)
+            state = self.workspace.export_state()
+            self._conversations[self._active_conv_id] = state
 
     def _on_nav_changed(self, page_id: str):
         if page_id == "projects":

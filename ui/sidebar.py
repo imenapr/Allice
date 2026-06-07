@@ -220,7 +220,7 @@ class Sidebar(QWidget):
 
     def add_conversation(self, title: str, conv_id: str, select: bool = False):
         item = ConversationItem(title[:28] + "…" if len(title) > 28 else title, conv_id)
-        item.clicked.connect(lambda: self.conversation_selected.emit(conv_id))
+        item.clicked.connect(lambda _checked=False, cid=conv_id: self.conversation_selected.emit(cid))
         self._conversations.append((conv_id, item))
 
         # Insert before the stretch at the end
@@ -230,8 +230,19 @@ class Sidebar(QWidget):
         if select:
             self._select_conversation(conv_id)
 
+    def select_conversation(self, conv_id: str):
+        self._select_conversation(conv_id)
+
     def _select_conversation(self, conv_id: str):
         for cid, btn in self._conversations:
             btn.setProperty("active", cid == conv_id)
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+
+    def update_conversation_title(self, conv_id: str, title: str):
+        for cid, btn in self._conversations:
+            if cid == conv_id:
+                display = title[:28] + "…" if len(title) > 28 else title
+                btn.setText(display)
+                btn.setToolTip(title)
+                break
